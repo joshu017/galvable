@@ -2,14 +2,27 @@
 """BLE client for GalvoCtrl ESP32-C3 galvanometer controller."""
 
 import asyncio
+import json
 import struct
+import subprocess
 import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.request import Request, urlopen
+from urllib.error import URLError, HTTPError
 
 from bleak import BleakScanner, BleakClient
 
 DEVICE_NAME = "GalvoCtrl"
 SERVICE_UUID = "e0f3a8b1-4c6d-4e9f-8b2a-7d1c5f3e9a0b"
 CHARACTERISTIC_UUID = "a1b2c3d4-5e6f-7890-abcd-ef1234567890"
+
+# Claude Code OAuth constants
+USAGE_API = "https://api.anthropic.com/api/oauth/usage"
+TOKEN_REFRESH_API = "https://console.anthropic.com/api/oauth/token"
+CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+USER_AGENT = "claude-code/2.1.1"
 
 
 def _is_galvo(d, adv):
@@ -64,10 +77,189 @@ async def write_value(client, value):
     print(f"Wrote {value:.4f}")
 
 
+# ── Claude Code usage helpers ────────────────────────────────────────────────
+
+def _load_creds_from_file(filepath):
+    """Load credentials from a JSON file."""
+    try:
+        return json.loads(filepath.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _load_creds_from_keychain():
+    """Load credentials from macOS Keychain."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        raw = subprocess.check_output(
+            ["security", "find-generic-password", "-s",
+             "Claude Code-credentials", "-w"],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        return json.loads(raw)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+
+
+def _load_credentials():
+    """Find and return Claude Code OAuth credentials."""
+    home = Path.home()
+    paths = [
+        home / ".claude" / ".credentials.json",
+        home / ".claude" / "credentials.json",
+    ]
+    for p in paths:
+        creds = _load_creds_from_file(p)
+        if creds and creds.get("claudeAiOauth", {}).get("accessToken"):
+            return creds, str(p)
+
+    creds = _load_creds_from_keychain()
+    if creds and creds.get("claudeAiOauth", {}).get("accessToken"):
+        return creds, "macOS Keychain"
+
+    print("Could not find Claude Code credentials.")
+    print("Make sure you've logged into Claude Code at least once.")
+    sys.exit(1)
+
+
+def _refresh_token(refresh_token):
+    """Exchange a refresh token for a new access token."""
+    payload = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_CODE_CLIENT_ID,
+    }).encode()
+    req = Request(TOKEN_REFRESH_API, data=payload,
+                  headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            return data.get("access_token")
+    except (URLError, HTTPError):
+        return None
+
+
+def _fetch_usage(access_token):
+    """Call the Anthropic usage API. Returns (data_dict, needs_refresh)."""
+    req = Request(USAGE_API, headers={
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-beta": "oauth-2025-04-20",
+    })
+    try:
+        with urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read()), False
+    except HTTPError as e:
+        if e.code == 401:
+            return None, True
+        raise
+
+
+def get_claude_usage_pct():
+    """Return the 5-hour utilization percentage, handling token refresh."""
+    creds, source = _load_credentials()
+    oauth = creds["claudeAiOauth"]
+    access_token = oauth["accessToken"]
+
+    data, needs_refresh = _fetch_usage(access_token)
+
+    if needs_refresh and oauth.get("refreshToken"):
+        print("  Token expired, refreshing...", end=" ", flush=True)
+        new_token = _refresh_token(oauth["refreshToken"])
+        if new_token:
+            print("done.")
+            data, _ = _fetch_usage(new_token)
+        else:
+            print("failed.")
+            return None
+
+    if not data:
+        return None
+
+    return data.get("five_hour", {}).get("utilization")
+
+
+def _format_reset(iso_str):
+    """Format a reset timestamp as a human-readable relative string."""
+    if not iso_str:
+        return "N/A"
+    reset = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+    now = datetime.now(timezone.utc)
+    diff = reset - now
+    secs = diff.total_seconds()
+    if secs <= 0:
+        return "already reset"
+    h = int(secs // 3600)
+    m = int((secs % 3600) // 60)
+    local = reset.astimezone().strftime("%-I:%M %p")
+    if h > 24:
+        d = h // 24
+        return f"{d}d {h % 24}h ({local})"
+    return f"{h}h {m}m ({local})"
+
+
+# ── Claude watch mode ────────────────────────────────────────────────────────
+
+async def claude_watch(client, interval):
+    """Continuously poll Claude usage and update the galvanometer."""
+    print(f"\n  Claude Code gauge — polling every {interval}s (Ctrl+C to stop)\n")
+
+    while True:
+        pct = get_claude_usage_pct()
+        if pct is not None:
+            remaining = (100.0 - pct) / 100.0
+            remaining = max(0.0, min(1.0, remaining))
+            data = struct.pack("<f", remaining)
+            await client.write_gatt_char(CHARACTERISTIC_UUID, data)
+
+            ts = datetime.now().strftime("%H:%M:%S")
+            bar_width = 30
+            filled = round(pct / 100 * bar_width)
+            bar = "█" * filled + "░" * (bar_width - filled)
+
+            # Color: green < 70, yellow 70-90, red >= 90
+            if pct >= 90:
+                color, reset = "\033[31m", "\033[0m"
+            elif pct >= 70:
+                color, reset = "\033[33m", "\033[0m"
+            else:
+                color, reset = "\033[32m", "\033[0m"
+
+            print(f"  [{ts}]  {color}{bar}{reset} {pct:.1f}% used → galvo {remaining:.4f}")
+        else:
+            print(f"  [{datetime.now().strftime('%H:%M:%S')}]  ⚠ Could not fetch usage")
+
+        await asyncio.sleep(interval)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
 async def main():
-    debug = "--debug" in sys.argv
+    args = sys.argv[1:]
+
+    debug = "--debug" in args
     if debug:
-        sys.argv.remove("--debug")
+        args.remove("--debug")
+
+    # Check for --claudewatch <seconds>
+    claude_watch_interval = None
+    if "--claudewatch" in args:
+        idx = args.index("--claudewatch")
+        if idx + 1 >= len(args):
+            print("--claudewatch requires an interval in seconds")
+            sys.exit(1)
+        try:
+            claude_watch_interval = int(args[idx + 1])
+            if claude_watch_interval <= 0:
+                raise ValueError
+        except ValueError:
+            print(f"Invalid --claudewatch interval: {args[idx + 1]}")
+            sys.exit(1)
+        args = args[:idx] + args[idx + 2:]
+
     device = await find_device(debug=debug)
     if not device:
         print("Device not found. Make sure ESP32-C3 is powered and advertising.")
@@ -76,8 +268,10 @@ async def main():
 
     try:
         async with BleakClient(device) as client:
-            if len(sys.argv) > 1:
-                value = float(sys.argv[1])
+            if claude_watch_interval is not None:
+                await claude_watch(client, claude_watch_interval)
+            elif args:
+                value = float(args[0])
                 if not (0.0 <= value <= 1.0):
                     print("Value must be between 0.0 and 1.0")
                     sys.exit(1)
@@ -107,4 +301,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        print("\nDisconnected.")

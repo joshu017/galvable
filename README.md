@@ -197,6 +197,18 @@ python galvo_client.py --debug
 
 This is useful for verifying that the ESP32-C3 is advertising and checking its service UUID.
 
+### Claude Code Gauge Mode
+
+Use `--claudewatch` to keep the BLE connection open and continuously display your Claude Code usage remaining on the galvanometer:
+
+```bash
+python galvo_client.py --claudewatch 30
+```
+
+This polls the Anthropic usage API every 30 seconds (or whatever interval you specify), inverts the percentage (so the gauge shows *remaining* capacity rather than used), and writes it to the galvo over the persistent BLE connection. A colored progress bar is printed to the terminal on each update.
+
+Requires Claude Code credentials (automatically found in `~/.claude/` or macOS Keychain).
+
 ### macOS Bluetooth Permissions
 
 On macOS, your terminal application (Terminal, iTerm2, etc.) needs Bluetooth access. If the script fails to find the device:
