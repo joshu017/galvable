@@ -1,0 +1,22 @@
+# Arduino build artifacts
+build/
+*.elf
+*.bin
+*.map
+*.hex
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+
+# IDE
+.vscode/
+*.swp
+*.swo
+*~
