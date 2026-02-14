@@ -4,9 +4,9 @@ Control an analog galvanometer over Bluetooth Low Energy using an ESP32-C3 micro
 
 ## Overview
 
-This project turns an ESP32-C3 into a BLE-controlled galvanometer driver. A BLE client writes a floating-point value (0.0 to 1.0) to the device, which translates it into a 10-bit PWM signal on GPIO4 to drive an analog movement galvanometer. The built-in LED (GPIO8) lights up when a client is connected.
+This project turns an ESP32-C3 into a BLE-controlled galvanometer driver with up to 6 independent PWM channels. A BLE client writes a floating-point value (0.0 to 1.0) to the device, optionally targeting a specific channel, which translates it into a 10-bit PWM signal to drive analog movement galvanometers. The built-in LED (GPIO8) lights up when a client is connected.
 
-A Python client for macOS is included for control from the command line.
+A Python client is included for control from the command line.
 
 ## Hardware Requirements
 
@@ -16,13 +16,28 @@ A Python client for macOS is included for control from the command line.
 
 ### Wiring
 
+Each galvo channel uses one GPIO pin. The default pin assignments are:
+
+| Channel | GPIO |
+|---------|------|
+| 0       | 4    |
+| 1       | 3    |
+| 2       | 2    |
+| 3       | 1    |
+| 4       | 0    |
+| 5       | 10   |
+
+Wire each channel the same way:
+
 ```
-GPIO4 --> potentiometer (12.5k ohm) --> galvo (+) --> galvo (-) --> GND
+GPIOx --> potentiometer (12.5k ohm) --> galvo (+) --> galvo (-) --> GND
 ```
 
-The potentiometer limits the maximum current through the galvanometer. Adjust it to set the full-scale deflection for a duty value of 1.0.
+The potentiometer limits the maximum current through the galvanometer. Adjust it to set the full-scale deflection for a duty value of 1.0. You only need to wire the channels you intend to use.
 
 > **Note:** The ESP32-C3 GPIO can source up to ~40 mA at 3.3V. Most panel-mount galvanometers draw well under this. The potentiometer provides an adjustable safety margin.
+
+> **Tip:** To change pin assignments or reduce the number of channels, edit the `GALVO_PINS[]` array in the sketch. The firmware automatically detects the number of active channels from the array length.
 
 ## Software Requirements
 
@@ -104,7 +119,7 @@ arduino-cli upload --fqbn esp32:esp32:esp32c3 -p /dev/cu.usbmodem* esp32c3_galvo
 Open the Serial Monitor at **115200 baud**. You should see:
 
 ```
-BLE Galvo Controller ... ready!
+BLE Galvo Controller (6 channels) ... ready!
 ```
 
 ## BLE Protocol
@@ -122,15 +137,24 @@ The device advertises with the following BLE profile:
 
 ### Data Format
 
-The characteristic accepts a **4-byte little-endian IEEE 754 float**:
+The characteristic accepts two write formats:
 
-| Byte Order    | Type    | Range       | Example (0.5)          |
-|---------------|---------|-------------|------------------------|
-| Little-endian | float32 | 0.0 - 1.0  | `0x00 0x00 0x00 0x3F`  |
+**4-byte write** (backward compatible — targets channel 0):
+
+| Bytes 0-3             | Description          |
+|-----------------------|----------------------|
+| float32 LE            | Value 0.0 - 1.0      |
+
+**5-byte write** (multi-channel — targets a specific channel):
+
+| Bytes 0-3             | Byte 4     | Description                  |
+|-----------------------|------------|------------------------------|
+| float32 LE            | uint8      | Value 0.0 - 1.0 + channel   |
 
 - Values are **clamped** to [0.0, 1.0] on the device
 - `NaN` and negative values are treated as 0.0
-- Writes with length other than 4 bytes are silently ignored
+- Invalid channel numbers are rejected with a debug message
+- Writes with length other than 4 or 5 bytes are silently ignored
 
 ### PWM Mapping
 
@@ -155,14 +179,9 @@ pip install bleak
 Write a single value and disconnect:
 
 ```bash
-python galvo_client.py 0.75
-```
-
-```
-Scanning for GalvoCtrl...
-Found GalvoCtrl at C5754105-72B8-9486-2E56-F310F115FFE1
-Wrote 0.7500
-Disconnected.
+python galvo_client.py 0.75             # write to channel 0 (default)
+python galvo_client.py 0.75 --channel 2 # write to channel 2
+python galvo_client.py 3:0.75           # shorthand: channel 3, value 0.75
 ```
 
 ### Interactive Mode
@@ -174,17 +193,21 @@ python galvo_client.py
 ```
 
 ```
-Scanning for GalvoCtrl...
-Found GalvoCtrl at C5754105-72B8-9486-2E56-F310F115FFE1
-Enter values 0.0-1.0 (q to quit):
-> 0.0
-Wrote 0.0000
+Enter values 0.0-1.0 or ch:value for a specific channel (q to quit):
 > 0.5
 Wrote 0.5000
-> 1.0
-Wrote 1.0000
+> 2:0.75
+Wrote 0.7500 to channel 2
+> 0:0.0
+Wrote 0.0000 to channel 0
 > q
 Disconnected.
+```
+
+Use `--channel` to set a default channel for all writes in a session:
+
+```bash
+python galvo_client.py --channel 3    # all writes target channel 3
 ```
 
 ### Debug Mode
@@ -202,12 +225,19 @@ This is useful for verifying that the ESP32-C3 is advertising and checking its s
 Use `--claudewatch` to keep the BLE connection open and continuously display your Claude Code usage remaining on the galvanometer:
 
 ```bash
-python galvo_client.py --claudewatch 30
+python galvo_client.py --claudewatch 30              # channel 0
+python galvo_client.py --claudewatch 30 --channel 2  # channel 2
 ```
 
 This polls the Anthropic usage API every 30 seconds (or whatever interval you specify), inverts the percentage (so the gauge shows *remaining* capacity rather than used), and writes it to the galvo over the persistent BLE connection. A colored progress bar is printed to the terminal on each update.
 
-Requires Claude Code credentials (automatically found in `~/.claude/` or macOS Keychain).
+Credentials are found automatically across platforms:
+
+| Platform    | Location                                      |
+|-------------|-----------------------------------------------|
+| Linux / WSL | `~/.claude/.credentials.json`                 |
+| macOS       | Keychain, then `~/.claude/.credentials.json`  |
+| Windows     | Credential Manager, then `~/.claude/.credentials.json` |
 
 ### macOS Bluetooth Permissions
 
@@ -222,13 +252,14 @@ On macOS, your terminal application (Terminal, iTerm2, etc.) needs Bluetooth acc
 ### Firmware
 
 1. The ESP32-C3 initializes a NimBLE BLE server with a single writable characteristic
-2. PWM is configured on GPIO4 using `ledcAttach()` at 5 kHz, 10-bit resolution
+2. PWM is configured on all channels in `GALVO_PINS[]` using `ledcAttach()` at 5 kHz, 10-bit resolution
 3. The built-in LED (GPIO8, active low) turns on when a client connects
-4. When a client writes 4 bytes to the characteristic:
-   - The bytes are decoded as a little-endian IEEE 754 float via `memcpy`
+4. When a client writes to the characteristic:
+   - **4-byte write:** decoded as a float, applied to channel 0
+   - **5-byte write:** first 4 bytes as float, 5th byte as channel index
    - The value is clamped to [0.0, 1.0] with `NaN` protection
    - The float is scaled to a duty cycle: `duty = (int)(value * 1000.0)`
-   - `ledcWrite()` outputs the PWM signal on GPIO4
+   - `ledcWrite()` outputs the PWM signal on the corresponding GPIO
 5. The galvanometer needle deflects proportionally to the duty cycle
 6. After disconnect, the LED turns off and the device re-advertises
 
@@ -236,7 +267,7 @@ On macOS, your terminal application (Terminal, iTerm2, etc.) needs Bluetooth acc
 
 1. Uses an async BLE scanner with a detection callback for fast discovery (returns immediately when device is found, rather than waiting for the full scan timeout)
 2. Matches the device by name (`GalvoCtrl`) or advertised service UUID
-3. Encodes the float value as 4 bytes using `struct.pack('<f', value)`
+3. Encodes the float value as 4 bytes (`struct.pack('<f', value)`) or 5 bytes with a channel index (`struct.pack('<fB', value, channel)`)
 4. Passes the `BLEDevice` object directly to `BleakClient` for reliable connection on macOS
 
 ## Known Issues

@@ -71,10 +71,20 @@ async def find_device(debug=False, timeout=10.0):
     return result[0]
 
 
-async def write_value(client, value):
-    data = struct.pack("<f", value)
-    await client.write_gatt_char(CHARACTERISTIC_UUID, data)
-    print(f"Wrote {value:.4f}")
+async def write_value(client, value, channel=None):
+    """Write a float value to the galvo, optionally targeting a specific channel.
+
+    4-byte write (float only) → device defaults to channel 0.
+    5-byte write (float + channel byte) → targets a specific channel.
+    """
+    if channel is not None:
+        data = struct.pack("<fB", value, channel)
+        await client.write_gatt_char(CHARACTERISTIC_UUID, data)
+        print(f"Wrote {value:.4f} to channel {channel}")
+    else:
+        data = struct.pack("<f", value)
+        await client.write_gatt_char(CHARACTERISTIC_UUID, data)
+        print(f"Wrote {value:.4f}")
 
 
 # ── Claude Code usage helpers ────────────────────────────────────────────────
@@ -254,16 +264,20 @@ def _format_reset(iso_str):
 
 # ── Claude watch mode ────────────────────────────────────────────────────────
 
-async def claude_watch(client, interval):
+async def claude_watch(client, interval, channel=None):
     """Continuously poll Claude usage and update the galvanometer."""
-    print(f"\n  Claude Code gauge — polling every {interval}s (Ctrl+C to stop)\n")
+    ch_label = f" (ch {channel})" if channel is not None else ""
+    print(f"\n  Claude Code gauge{ch_label} — polling every {interval}s (Ctrl+C to stop)\n")
 
     while True:
         pct = get_claude_usage_pct()
         if pct is not None:
             remaining = (100.0 - pct) / 100.0
             remaining = max(0.0, min(1.0, remaining))
-            data = struct.pack("<f", remaining)
+            if channel is not None:
+                data = struct.pack("<fB", remaining, channel)
+            else:
+                data = struct.pack("<f", remaining)
             await client.write_gatt_char(CHARACTERISTIC_UUID, data)
 
             ts = datetime.now().strftime("%H:%M:%S")
@@ -288,12 +302,38 @@ async def claude_watch(client, interval):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def _parse_channel_value(s):
+    """Parse 'ch:value' or plain 'value' string. Returns (value, channel)."""
+    if ":" in s:
+        parts = s.split(":", 1)
+        ch = int(parts[0])
+        val = float(parts[1])
+        return val, ch
+    return float(s), None
+
+
 async def main():
     args = sys.argv[1:]
 
     debug = "--debug" in args
     if debug:
         args.remove("--debug")
+
+    # Check for --channel <n>
+    channel = None
+    if "--channel" in args:
+        idx = args.index("--channel")
+        if idx + 1 >= len(args):
+            print("--channel requires a channel number (0-5)")
+            sys.exit(1)
+        try:
+            channel = int(args[idx + 1])
+            if channel < 0:
+                raise ValueError
+        except ValueError:
+            print(f"Invalid --channel value: {args[idx + 1]}")
+            sys.exit(1)
+        args = args[:idx] + args[idx + 2:]
 
     # Check for --claudewatch <seconds>
     claude_watch_interval = None
@@ -320,27 +360,30 @@ async def main():
     try:
         async with BleakClient(device) as client:
             if claude_watch_interval is not None:
-                await claude_watch(client, claude_watch_interval)
+                await claude_watch(client, claude_watch_interval, channel)
             elif args:
-                value = float(args[0])
+                value, ch_override = _parse_channel_value(args[0])
+                ch = ch_override if ch_override is not None else channel
                 if not (0.0 <= value <= 1.0):
                     print("Value must be between 0.0 and 1.0")
                     sys.exit(1)
-                await write_value(client, value)
+                await write_value(client, value, ch)
             else:
-                print("Enter values 0.0-1.0 (q to quit):")
+                ch_hint = f" or ch:value for a specific channel" if channel is None else ""
+                print(f"Enter values 0.0-1.0{ch_hint} (q to quit):")
                 while True:
                     try:
                         raw = input("> ").strip()
                         if raw.lower() == "q":
                             break
-                        val = float(raw)
+                        val, ch_override = _parse_channel_value(raw)
+                        ch = ch_override if ch_override is not None else channel
                         if not (0.0 <= val <= 1.0):
                             print("Value must be between 0.0 and 1.0")
                             continue
-                        await write_value(client, val)
+                        await write_value(client, val, ch)
                     except ValueError:
-                        print("Invalid number")
+                        print("Invalid input (use 0.5 or 2:0.5)")
                     except KeyboardInterrupt:
                         break
     except KeyboardInterrupt:
