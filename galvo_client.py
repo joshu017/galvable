@@ -102,8 +102,45 @@ def _load_creds_from_keychain():
         return None
 
 
+def _load_creds_from_wincred():
+    """Load credentials from Windows Credential Manager via PowerShell."""
+    if sys.platform != "win32":
+        return None
+    # Use the PasswordVault WinRT API through PowerShell — no extra deps
+    ps_script = (
+        '[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime] | Out-Null; '
+        '$v = New-Object Windows.Security.Credentials.PasswordVault; '
+        '$c = $v.Retrieve("Claude Code-credentials", "credentials"); '
+        '$c.RetrievePassword(); '
+        '$c.Password'
+    )
+    try:
+        raw = subprocess.check_output(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            stderr=subprocess.DEVNULL, text=True
+        ).strip()
+        return json.loads(raw)
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        pass
+
+    # Fallback: try cmdkey-based approach for generic credentials
+    try:
+        # cmdkey can't retrieve passwords, but the file path fallback
+        # covers most Windows cases since WSL uses file-based creds
+        return None
+    except Exception:
+        return None
+
+
 def _load_credentials():
-    """Find and return Claude Code OAuth credentials."""
+    """Find and return Claude Code OAuth credentials.
+
+    Search order:
+      1. File: ~/.claude/.credentials.json  (Linux, WSL, sometimes Windows)
+      2. File: ~/.claude/credentials.json    (alternative)
+      3. macOS Keychain                      (macOS)
+      4. Windows Credential Manager          (Windows)
+    """
     home = Path.home()
     paths = [
         home / ".claude" / ".credentials.json",
@@ -114,12 +151,26 @@ def _load_credentials():
         if creds and creds.get("claudeAiOauth", {}).get("accessToken"):
             return creds, str(p)
 
+    # Platform-specific credential stores
     creds = _load_creds_from_keychain()
     if creds and creds.get("claudeAiOauth", {}).get("accessToken"):
         return creds, "macOS Keychain"
 
+    creds = _load_creds_from_wincred()
+    if creds and creds.get("claudeAiOauth", {}).get("accessToken"):
+        return creds, "Windows Credential Manager"
+
+    checked = [str(p) for p in paths]
+    if sys.platform == "darwin":
+        checked.append('macOS Keychain ("Claude Code-credentials")')
+    elif sys.platform == "win32":
+        checked.append('Windows Credential Manager ("Claude Code-credentials")')
+
     print("Could not find Claude Code credentials.")
-    print("Make sure you've logged into Claude Code at least once.")
+    print("Checked:")
+    for loc in checked:
+        print(f"  - {loc}")
+    print("\nMake sure you've logged into Claude Code at least once.")
     sys.exit(1)
 
 
