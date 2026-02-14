@@ -1,17 +1,18 @@
 # Galvable
 
-Control an analog galvanometer over Bluetooth Low Energy using an ESP32-C3 microcontroller.
+Control an analog galvanometer (or six) over Bluetooth Low Energy using an ESP32-C3 microcontroller.
 
 ## Overview
 
-This project turns an ESP32-C3 into a BLE-controlled galvanometer driver with up to 6 independent PWM channels. A BLE client writes a floating-point value (0.0 to 1.0) to the device, optionally targeting a specific channel, which translates it into a 10-bit PWM signal to drive analog movement galvanometers. The built-in LED (GPIO8) lights up when a client is connected.
+This project turns an ESP32-C3 into a BLE-controlled galvanometer driver with up to 6 independent PWM channels. A BLE client writes a floating-point value (0.0 to 1.0) to the device, optionally targeting a specific channel, which translates it into a 10-bit PWM signal to drive analog movement galvanometers. The built-in LED (GPIO8 on the esp32c3 supermini dev board) lights up when a client is connected.
 
-A Python client is included for control from the command line.
+A reference implementation of a Python client is included for controlling the device from the command line.
 
 ## Hardware Requirements
 
 - **ESP32-C3 SuperMini** (or any ESP32-C3 board with USB-C)
-- **Analog galvanometer** with current-limiting potentiometer
+- **Analog galvanometer**
+- **Potentiometer** (recommended: multi-turn 20-100k ohm potentiometer)
 - USB cable for programming and serial monitoring
 
 ### Wiring
@@ -30,22 +31,22 @@ Each galvo channel uses one GPIO pin. The default pin assignments are:
 Wire each channel the same way:
 
 ```
-GPIOx --> potentiometer (12.5k ohm) --> galvo (+) --> galvo (-) --> GND
+GPIOx --> potentiometer (adjust to the high end of its resistance before calibration) --> galvo (+) --> galvo (-) --> GND
 ```
 
-The potentiometer limits the maximum current through the galvanometer. Adjust it to set the full-scale deflection for a duty value of 1.0. You only need to wire the channels you intend to use.
+The potentiometer limits the maximum current through the galvanometer so that it is well within the limits of the current that can be drawn through each GPIO pin. Adjust it to set the full-scale deflection for a duty value of 1.0. You only need to wire up the channels you intend to use.
 
 > **Note:** The ESP32-C3 GPIO can source up to ~40 mA at 3.3V. Most panel-mount galvanometers draw well under this. The potentiometer provides an adjustable safety margin.
 
-> **Tip:** To change pin assignments or reduce the number of channels, edit the `GALVO_PINS[]` array in the sketch. The firmware automatically detects the number of active channels from the array length.
+> **Tip:** To change pin assignments or reduce the number of channels, edit the `GALVO_PINS[]` array in the sketch. The firmware automatically detects the number of active channels from the array length.  There is no penalty to leaving all defaults defined, even if you are planning on connecting fewer galvanometers.
 
 ## Software Requirements
 
 ### Firmware (Arduino)
 
 - [Arduino IDE](https://www.arduino.cc/en/software) or [Arduino CLI](https://arduino.github.io/arduino-cli/)
-- **ESP32 board package:** "esp32 by Espressif Systems" v3.x
-- **BLE library:** [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) v2.x by h2zero
+- **ESP32 board package:** "esp32 by Espressif Systems" v3.x (tested on v3.3.7)
+- **BLE library:** [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) v2.x by h2zero (tested on v2.3.7)
 
 ### Python Client
 
