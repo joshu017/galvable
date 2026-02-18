@@ -219,8 +219,8 @@ def _fetch_usage(access_token):
         raise
 
 
-def get_claude_usage_pct():
-    """Return the 5-hour utilization percentage, handling token refresh."""
+def get_claude_usage():
+    """Return the 5-hour usage dict (utilization + resets_at), handling token refresh."""
     creds, source = _load_credentials()
     oauth = creds["claudeAiOauth"]
     access_token = oauth["accessToken"]
@@ -240,7 +240,7 @@ def get_claude_usage_pct():
     if not data:
         return None
 
-    return data.get("five_hour", {}).get("utilization")
+    return data.get("five_hour")
 
 
 def _format_reset(iso_str):
@@ -270,8 +270,9 @@ async def claude_watch(client, interval, channel=None):
     print(f"\n  Claude Code gauge{ch_label} — polling every {interval}s (Ctrl+C to stop)\n")
 
     while True:
-        pct = get_claude_usage_pct()
-        if pct is not None:
+        usage = get_claude_usage()
+        if usage is not None:
+            pct = usage.get("utilization", 0)
             remaining = (100.0 - pct) / 100.0
             remaining = max(0.0, min(1.0, remaining))
             if channel is not None:
@@ -280,20 +281,20 @@ async def claude_watch(client, interval, channel=None):
                 data = struct.pack("<f", remaining)
             await client.write_gatt_char(CHARACTERISTIC_UUID, data)
 
-            ts = datetime.now().strftime("%H:%M:%S")
+            resets = _format_reset(usage.get("resets_at"))
             bar_width = 30
             filled = round(pct / 100 * bar_width)
             bar = "█" * filled + "░" * (bar_width - filled)
 
             # Color: green < 70, yellow 70-90, red >= 90
             if pct >= 90:
-                color, reset = "\033[31m", "\033[0m"
+                color, rst = "\033[31m", "\033[0m"
             elif pct >= 70:
-                color, reset = "\033[33m", "\033[0m"
+                color, rst = "\033[33m", "\033[0m"
             else:
-                color, reset = "\033[32m", "\033[0m"
+                color, rst = "\033[32m", "\033[0m"
 
-            print(f"  [{ts}]  {color}{bar}{reset} {pct:.1f}% used → galvo {remaining:.4f}")
+            print(f"  [{resets}]  {color}{bar}{rst} {pct:.1f}% used → galvo {remaining:.4f}")
         else:
             print(f"  [{datetime.now().strftime('%H:%M:%S')}]  ⚠ Could not fetch usage")
 
