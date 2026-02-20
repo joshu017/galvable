@@ -265,9 +265,14 @@ def _format_reset(iso_str):
 # ── Claude watch mode ────────────────────────────────────────────────────────
 
 async def claude_watch(client, interval, channel=None):
-    """Continuously poll Claude usage and update the galvanometer."""
+    """Continuously poll Claude usage and update the galvanometer.
+
+    If client is None, usage is displayed in the terminal but not
+    written to a BLE device (useful when no device is available).
+    """
     ch_label = f" (ch {channel})" if channel is not None else ""
-    print(f"\n  Claude Code gauge{ch_label} — polling every {interval}s (Ctrl+C to stop)\n")
+    ble_label = "" if client else " (no BLE device)"
+    print(f"\n  Claude Code gauge{ch_label}{ble_label} — polling every {interval}s (Ctrl+C to stop)\n")
 
     while True:
         usage = get_claude_usage()
@@ -275,11 +280,14 @@ async def claude_watch(client, interval, channel=None):
             pct = usage.get("utilization", 0)
             remaining = (100.0 - pct) / 100.0
             remaining = max(0.0, min(1.0, remaining))
-            if channel is not None:
-                data = struct.pack("<fB", remaining, channel)
-            else:
-                data = struct.pack("<f", remaining)
-            await client.write_gatt_char(CHARACTERISTIC_UUID, data)
+
+            # Write to BLE device if connected
+            if client:
+                if channel is not None:
+                    data = struct.pack("<fB", remaining, channel)
+                else:
+                    data = struct.pack("<f", remaining)
+                await client.write_gatt_char(CHARACTERISTIC_UUID, data)
 
             resets = _format_reset(usage.get("resets_at"))
             bar_width = 30
@@ -294,7 +302,8 @@ async def claude_watch(client, interval, channel=None):
             else:
                 color, rst = "\033[32m", "\033[0m"
 
-            print(f"  [{resets}]  {color}{bar}{rst} {pct:.1f}% used → galvo {remaining:.4f}")
+            galvo_str = f" → galvo {remaining:.4f}" if client else ""
+            print(f"  [{resets}]  {color}{bar}{rst} {pct:.1f}% used{galvo_str}")
         else:
             print(f"  [{datetime.now().strftime('%H:%M:%S')}]  ⚠ Could not fetch usage")
 
@@ -354,6 +363,14 @@ async def main():
 
     device = await find_device(debug=debug)
     if not device:
+        if claude_watch_interval is not None:
+            # In claudewatch mode, continue without BLE — just show usage data
+            print("BLE device not found — running in display-only mode.")
+            try:
+                await claude_watch(None, claude_watch_interval, channel)
+            except KeyboardInterrupt:
+                pass
+            return
         print("Device not found. Make sure ESP32-C3 is powered and advertising.")
         sys.exit(1)
     print(f"Found {DEVICE_NAME} at {device.address}")
