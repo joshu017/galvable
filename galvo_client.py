@@ -216,6 +216,9 @@ def _fetch_usage(access_token):
     except HTTPError as e:
         if e.code == 401:
             return None, True
+        if e.code == 429:
+            print("  ⚠ Rate limited (429) — will retry next interval")
+            return None, False
         raise
 
 
@@ -289,37 +292,40 @@ async def claude_watch(client, interval, channel=None):
     print(f"\n  Claude Code gauge{ch_label}{ble_label} — polling every {interval}s (Ctrl+C to stop)\n")
 
     while True:
-        usage = get_claude_usage()
-        if usage is not None:
-            pct = usage.get("utilization", 0)
-            remaining = (100.0 - pct) / 100.0
-            remaining = max(0.0, min(1.0, remaining))
+        try:
+            usage = get_claude_usage()
+            if usage is not None:
+                pct = usage.get("utilization", 0)
+                remaining = (100.0 - pct) / 100.0
+                remaining = max(0.0, min(1.0, remaining))
 
-            # Write to BLE device if connected
-            if client:
-                if channel is not None:
-                    data = struct.pack("<fB", remaining, channel)
+                # Write to BLE device if connected
+                if client:
+                    if channel is not None:
+                        data = struct.pack("<fB", remaining, channel)
+                    else:
+                        data = struct.pack("<f", remaining)
+                    await client.write_gatt_char(CHARACTERISTIC_UUID, data)
+
+                resets = _format_reset(usage.get("resets_at"))
+                bar_width = 30
+                filled = round(pct / 100 * bar_width)
+                bar = "█" * filled + "░" * (bar_width - filled)
+
+                # Color: green < 70, yellow 70-90, red >= 90
+                if pct >= 90:
+                    color, rst = "\033[31m", "\033[0m"
+                elif pct >= 70:
+                    color, rst = "\033[33m", "\033[0m"
                 else:
-                    data = struct.pack("<f", remaining)
-                await client.write_gatt_char(CHARACTERISTIC_UUID, data)
+                    color, rst = "\033[32m", "\033[0m"
 
-            resets = _format_reset(usage.get("resets_at"))
-            bar_width = 30
-            filled = round(pct / 100 * bar_width)
-            bar = "█" * filled + "░" * (bar_width - filled)
-
-            # Color: green < 70, yellow 70-90, red >= 90
-            if pct >= 90:
-                color, rst = "\033[31m", "\033[0m"
-            elif pct >= 70:
-                color, rst = "\033[33m", "\033[0m"
+                galvo_str = f" → galvo {remaining:.4f}" if client else ""
+                print(f"  [{resets}]  {color}{bar}{rst} {pct:.1f}% used{galvo_str}")
             else:
-                color, rst = "\033[32m", "\033[0m"
-
-            galvo_str = f" → galvo {remaining:.4f}" if client else ""
-            print(f"  [{resets}]  {color}{bar}{rst} {pct:.1f}% used{galvo_str}")
-        else:
-            print(f"  [{datetime.now().strftime('%H:%M:%S')}]  ⚠ Could not fetch usage")
+                print(f"  [{datetime.now().strftime('%H:%M:%S')}]  ⚠ Could not fetch usage")
+        except Exception as e:
+            print(f"  [{datetime.now().strftime('%H:%M:%S')}]  ⚠ Error: {e}")
 
         await asyncio.sleep(interval)
 
