@@ -264,12 +264,26 @@ def _format_reset(iso_str):
 
 # ── Claude watch mode ────────────────────────────────────────────────────────
 
+_CLAUDEWATCH_DISCLAIMER = """\
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  WARNING: This feature accesses the Anthropic usage API using   │
+  │  your Claude Code OAuth credentials. This is an undocumented    │
+  │  API and its use may violate Anthropic's Terms of Service.      │
+  │                                                                 │
+  │  Use at your own risk. The authors of this project are not      │
+  │  responsible for any consequences of using this feature.        │
+  └─────────────────────────────────────────────────────────────────┘"""
+
+
 async def claude_watch(client, interval, channel=None):
     """Continuously poll Claude usage and update the galvanometer.
 
     If client is None, usage is displayed in the terminal but not
     written to a BLE device (useful when no device is available).
     """
+    print(f"\n{_CLAUDEWATCH_DISCLAIMER}\n")
+    input("  Press Enter to continue, or Ctrl+C to cancel... ")
+
     ch_label = f" (ch {channel})" if channel is not None else ""
     ble_label = "" if client else " (no BLE device)"
     print(f"\n  Claude Code gauge{ch_label}{ble_label} — polling every {interval}s (Ctrl+C to stop)\n")
