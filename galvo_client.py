@@ -3,334 +3,186 @@
 
 import asyncio
 import json
+import readline  # noqa: F401 — enables arrow-key history in input()
 import struct
-import subprocess
 import sys
-import time
-from datetime import datetime, timezone
-from pathlib import Path
-from urllib.request import Request, urlopen
-from urllib.error import URLError, HTTPError
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from bleak import BleakScanner, BleakClient
+import galvable
 
-DEVICE_NAME = "GalvoCtrl"
-SERVICE_UUID = "e0f3a8b1-4c6d-4e9f-8b2a-7d1c5f3e9a0b"
-CHARACTERISTIC_UUID = "a1b2c3d4-5e6f-7890-abcd-ef1234567890"
+HELP_TEXT = """\
+usage: galvo_client.py [options] [value]
 
-# Claude Code OAuth constants
-USAGE_API = "https://api.anthropic.com/api/oauth/usage"
-TOKEN_REFRESH_API = "https://console.anthropic.com/api/oauth/token"
-CLAUDE_CODE_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
-USER_AGENT = "claude-code/2.1.1"
+BLE client for the GalvoCtrl ESP32-C3 galvanometer controller.
 
+positional arguments:
+  value                 float 0.0-1.0 to write (or ch:value, e.g. 2:0.75).
+                        omit for interactive mode.
 
-def _is_galvo(d, adv):
-    return adv.local_name == DEVICE_NAME or SERVICE_UUID in adv.service_uuids
-
-
-async def find_device(debug=False, timeout=10.0):
-    print(f"Scanning for {DEVICE_NAME}...")
-
-    if debug:
-        # Full scan to list all devices
-        discovered = await BleakScanner.discover(timeout=timeout, return_adv=True)
-        print(f"\n{'='*60}")
-        print(f"Found {len(discovered)} BLE device(s):")
-        print(f"{'='*60}")
-        items = sorted(discovered.values(), key=lambda x: x[0].address)
-        with_svcs = [(d, adv) for d, adv in items if adv.service_uuids]
-        for d, adv in with_svcs:
-            name = adv.local_name or "(no name)"
-            svcs = ", ".join(adv.service_uuids)
-            print(f"  {name:30s}  {d.address}")
-            print(f"    advertised services: {svcs}")
-        print(f"  ({len(discovered) - len(with_svcs)} other device(s) with no advertised services)")
-        print(f"{'='*60}\n")
-        for d, adv in discovered.values():
-            if _is_galvo(d, adv):
-                return d
-        return None
-
-    # Fast scan: return immediately when device is found
-    found_event = asyncio.Event()
-    result = [None]
-
-    def on_detect(d, adv):
-        if _is_galvo(d, adv):
-            result[0] = d
-            found_event.set()
-
-    scanner = BleakScanner(detection_callback=on_detect)
-    await scanner.start()
-    try:
-        await asyncio.wait_for(found_event.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        pass
-    await scanner.stop()
-    return result[0]
+options:
+  --name NAME           connect to a specific galvo by its device name
+  --id ADDRESS          connect to a specific galvo by BLE address
+  --channel N           target channel for all writes (0-5)
+  --claudewatch         run a web bridge that accepts Claude Code usage
+                        data from a browser bookmarklet and drives the
+                        galvo accordingly
+  --scan                scan for GalvoCtrl devices and report their IDs
+  --rename ID NAME      rename a galvo (ID is its name or BLE address)
+  --debug               verbose BLE scan listing all discovered devices
+  --help                show this help message and exit
+"""
 
 
-async def write_value(client, value, channel=None):
-    """Write a float value to the galvo, optionally targeting a specific channel.
+# ── Claude watch mode (web bridge) ──────────────────────────────────────────
 
-    4-byte write (float only) → device defaults to channel 0.
-    5-byte write (float + channel byte) → targets a specific channel.
-    """
-    if channel is not None:
-        data = struct.pack("<fB", value, channel)
-        await client.write_gatt_char(CHARACTERISTIC_UUID, data)
-        print(f"Wrote {value:.4f} to channel {channel}")
-    else:
-        data = struct.pack("<f", value)
-        await client.write_gatt_char(CHARACTERISTIC_UUID, data)
-        print(f"Wrote {value:.4f}")
-
-
-# ── Claude Code usage helpers ────────────────────────────────────────────────
-
-def _load_creds_from_file(filepath):
-    """Load credentials from a JSON file."""
-    try:
-        return json.loads(filepath.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-
-
-def _load_creds_from_keychain():
-    """Load credentials from macOS Keychain."""
-    if sys.platform != "darwin":
-        return None
-    try:
-        raw = subprocess.check_output(
-            ["security", "find-generic-password", "-s",
-             "Claude Code-credentials", "-w"],
-            stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        return json.loads(raw)
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
-        return None
+_OVERLAY_JS = """\
+(function(){
+  var B="http://localhost:__PORT__",P=15000;
+  function scrape(){
+    for(var p of document.querySelectorAll("p"))
+      if(p.textContent.trim()==="Current session"){
+        var c=p.closest(".flex.flex-row");if(!c)continue;
+        var u=c.querySelector('p[class*="text-right"]');
+        if(u){var m=u.textContent.match(/(\\d+)%/);if(m)return+m[1]}
+      }
+    return null}
+  var h=document.createElement("div");
+  Object.assign(h.style,{position:"fixed",bottom:"12px",right:"12px",zIndex:99999,
+    background:"#1a1a2e",color:"#0f0",fontFamily:"monospace",fontSize:"13px",
+    padding:"8px 12px",borderRadius:"8px",border:"1px solid #333",
+    boxShadow:"0 2px 12px rgba(0,0,0,.5)"});
+  h.innerHTML='<strong style="color:#0ff">GALVO</strong> <span id="gv">--</span>';
+  document.body.appendChild(h);
+  var gv=document.getElementById("gv");
+  async function poll(){
+    var pct=scrape();if(pct===null){gv.textContent="??";return}
+    try{
+      var r=await fetch(B+"/update",{method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({percent:pct})});
+      if(r.ok){var d=await r.json();
+        gv.textContent=pct+"% \\u2192 "+d.galvo.toFixed(2);
+        gv.style.color="#0f0"}
+      else{gv.textContent=pct+"% (err)";gv.style.color="#f00"}
+    }catch(_){gv.textContent=pct+"% (offline)";gv.style.color="#f80"}
+  }
+  function refresh(){var b=document.querySelector('button[aria-label="Refresh usage limits"]');if(b)b.click()}
+  poll();setInterval(function(){refresh();setTimeout(poll,2000)},P);
+})();
+"""
 
 
-def _load_creds_from_wincred():
-    """Load credentials from Windows Credential Manager via PowerShell."""
-    if sys.platform != "win32":
-        return None
-    # Use the PasswordVault WinRT API through PowerShell — no extra deps
-    ps_script = (
-        '[Windows.Security.Credentials.PasswordVault,Windows.Security.Credentials,ContentType=WindowsRuntime] | Out-Null; '
-        '$v = New-Object Windows.Security.Credentials.PasswordVault; '
-        '$c = $v.Retrieve("Claude Code-credentials", "credentials"); '
-        '$c.RetrievePassword(); '
-        '$c.Password'
-    )
-    try:
-        raw = subprocess.check_output(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-            stderr=subprocess.DEVNULL, text=True
-        ).strip()
-        return json.loads(raw)
-    except (subprocess.CalledProcessError, json.JSONDecodeError):
-        pass
+def _make_web_handler(loop, conn, channel, js_content):
+    """Create an HTTP handler that bridges browser POST → BLE write."""
 
-    # Fallback: try cmdkey-based approach for generic credentials
-    try:
-        # cmdkey can't retrieve passwords, but the file path fallback
-        # covers most Windows cases since WSL uses file-based creds
-        return None
-    except Exception:
-        return None
+    class Handler(BaseHTTPRequestHandler):
+        def _cors(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
 
-def _load_credentials():
-    """Find and return Claude Code OAuth credentials.
+        def do_GET(self):
+            body = js_content.encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/javascript")
+            self.send_header("Content-Length", str(len(body)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(body)
 
-    Search order:
-      1. File: ~/.claude/.credentials.json  (Linux, WSL, sometimes Windows)
-      2. File: ~/.claude/credentials.json    (alternative)
-      3. macOS Keychain                      (macOS)
-      4. Windows Credential Manager          (Windows)
-    """
-    home = Path.home()
-    paths = [
-        home / ".claude" / ".credentials.json",
-        home / ".claude" / "credentials.json",
-    ]
-    for p in paths:
-        creds = _load_creds_from_file(p)
-        if creds and creds.get("claudeAiOauth", {}).get("accessToken"):
-            return creds, str(p)
+        def do_POST(self):
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                data = json.loads(self.rfile.read(length))
+                pct = float(data.get("percent", 0))
+                remaining = max(0.0, min(1.0, (100.0 - pct) / 100.0))
 
-    # Platform-specific credential stores
-    creds = _load_creds_from_keychain()
-    if creds and creds.get("claudeAiOauth", {}).get("accessToken"):
-        return creds, "macOS Keychain"
-
-    creds = _load_creds_from_wincred()
-    if creds and creds.get("claudeAiOauth", {}).get("accessToken"):
-        return creds, "Windows Credential Manager"
-
-    checked = [str(p) for p in paths]
-    if sys.platform == "darwin":
-        checked.append('macOS Keychain ("Claude Code-credentials")')
-    elif sys.platform == "win32":
-        checked.append('Windows Credential Manager ("Claude Code-credentials")')
-
-    print("Could not find Claude Code credentials.")
-    print("Checked:")
-    for loc in checked:
-        print(f"  - {loc}")
-    print("\nMake sure you've logged into Claude Code at least once.")
-    sys.exit(1)
-
-
-def _refresh_token(refresh_token):
-    """Exchange a refresh token for a new access token."""
-    payload = json.dumps({
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-        "client_id": CLAUDE_CODE_CLIENT_ID,
-    }).encode()
-    req = Request(TOKEN_REFRESH_API, data=payload,
-                  headers={"Content-Type": "application/json"}, method="POST")
-    try:
-        with urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-            return data.get("access_token")
-    except (URLError, HTTPError):
-        return None
-
-
-def _fetch_usage(access_token):
-    """Call the Anthropic usage API. Returns (data_dict, needs_refresh)."""
-    req = Request(USAGE_API, headers={
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": USER_AGENT,
-        "Authorization": f"Bearer {access_token}",
-        "anthropic-beta": "oauth-2025-04-20",
-    })
-    try:
-        with urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read()), False
-    except HTTPError as e:
-        if e.code == 401:
-            return None, True
-        if e.code == 429:
-            print("  ⚠ Rate limited (429) — will retry next interval")
-            return None, False
-        raise
-
-
-def get_claude_usage():
-    """Return the 5-hour usage dict (utilization + resets_at), handling token refresh."""
-    creds, source = _load_credentials()
-    oauth = creds["claudeAiOauth"]
-    access_token = oauth["accessToken"]
-
-    data, needs_refresh = _fetch_usage(access_token)
-
-    if needs_refresh and oauth.get("refreshToken"):
-        print("  Token expired, refreshing...", end=" ", flush=True)
-        new_token = _refresh_token(oauth["refreshToken"])
-        if new_token:
-            print("done.")
-            data, _ = _fetch_usage(new_token)
-        else:
-            print("failed.")
-            return None
-
-    if not data:
-        return None
-
-    return data.get("five_hour")
-
-
-def _format_reset(iso_str):
-    """Format a reset timestamp as a human-readable relative string."""
-    if not iso_str:
-        return "N/A"
-    reset = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
-    now = datetime.now(timezone.utc)
-    diff = reset - now
-    secs = diff.total_seconds()
-    if secs <= 0:
-        return "already reset"
-    h = int(secs // 3600)
-    m = int((secs % 3600) // 60)
-    local = reset.astimezone().strftime("%-I:%M %p")
-    if h > 24:
-        d = h // 24
-        return f"{d}d {h % 24}h ({local})"
-    return f"{h}h {m}m ({local})"
-
-
-# ── Claude watch mode ────────────────────────────────────────────────────────
-
-_CLAUDEWATCH_DISCLAIMER = """\
-  ┌─────────────────────────────────────────────────────────────────┐
-  │  WARNING: This feature accesses the Anthropic usage API using   │
-  │  your Claude Code OAuth credentials. This is an undocumented    │
-  │  API and its use may violate Anthropic's Terms of Service.      │
-  │                                                                 │
-  │  Use at your own risk. The authors of this project are not      │
-  │  responsible for any consequences of using this feature.        │
-  └─────────────────────────────────────────────────────────────────┘"""
-
-
-async def claude_watch(client, interval, channel=None):
-    """Continuously poll Claude usage and update the galvanometer.
-
-    If client is None, usage is displayed in the terminal but not
-    written to a BLE device (useful when no device is available).
-    """
-    print(f"\n{_CLAUDEWATCH_DISCLAIMER}\n")
-    input("  Press Enter to continue, or Ctrl+C to cancel... ")
-
-    ch_label = f" (ch {channel})" if channel is not None else ""
-    ble_label = "" if client else " (no BLE device)"
-    print(f"\n  Claude Code gauge{ch_label}{ble_label} — polling every {interval}s (Ctrl+C to stop)\n")
-
-    while True:
-        try:
-            usage = get_claude_usage()
-            if usage is not None:
-                pct = usage.get("utilization", 0)
-                remaining = (100.0 - pct) / 100.0
-                remaining = max(0.0, min(1.0, remaining))
-
-                # Write to BLE device if connected
-                if client:
+                ble_ok = False
+                if conn:
                     if channel is not None:
-                        data = struct.pack("<fB", remaining, channel)
+                        payload = struct.pack("<fB", remaining, channel)
                     else:
-                        data = struct.pack("<f", remaining)
-                    await client.write_gatt_char(CHARACTERISTIC_UUID, data)
+                        payload = struct.pack("<f", remaining)
+                    try:
+                        fut = asyncio.run_coroutine_threadsafe(
+                            conn.write_raw(payload), loop,
+                        )
+                        fut.result(timeout=5)
+                        ble_ok = True
+                    except Exception as e:
+                        print(f"  \u26a0 BLE write failed: {e}")
 
-                resets = _format_reset(usage.get("resets_at"))
-                bar_width = 30
-                filled = round(pct / 100 * bar_width)
-                bar = "█" * filled + "░" * (bar_width - filled)
-
-                # Color: green < 70, yellow 70-90, red >= 90
+                # Terminal bar
+                bar_w = 30
+                filled = round(pct / 100 * bar_w)
+                bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
                 if pct >= 90:
-                    color, rst = "\033[31m", "\033[0m"
+                    c, r = "\033[31m", "\033[0m"
                 elif pct >= 70:
-                    color, rst = "\033[33m", "\033[0m"
+                    c, r = "\033[33m", "\033[0m"
                 else:
-                    color, rst = "\033[32m", "\033[0m"
+                    c, r = "\033[32m", "\033[0m"
+                ble_s = f" \u2192 galvo {remaining:.4f}" if ble_ok else " (no BLE)"
+                print(f"  {c}{bar}{r} {pct:.0f}% used{ble_s}")
 
-                galvo_str = f" → galvo {remaining:.4f}" if client else ""
-                print(f"  [{resets}]  {color}{bar}{rst} {pct:.1f}% used{galvo_str}")
-            else:
-                print(f"  [{datetime.now().strftime('%H:%M:%S')}]  ⚠ Could not fetch usage")
-        except Exception as e:
-            print(f"  [{datetime.now().strftime('%H:%M:%S')}]  ⚠ Error: {e}")
+                resp = json.dumps({
+                    "ack": ble_ok, "pct": pct, "galvo": round(remaining, 4),
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self._cors()
+                self.end_headers()
+                self.wfile.write(resp)
+            except Exception as e:
+                self.send_response(500)
+                self._cors()
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": str(e)}).encode())
 
-        await asyncio.sleep(interval)
+        def log_message(self, *_a):
+            pass
+
+    return Handler
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+async def claude_watch(conn, channel=None):
+    """Serve the JS overlay and bridge browser scrape → BLE."""
+    port = 8384
+    js_content = _OVERLAY_JS.replace("__PORT__", str(port))
+
+    loop = asyncio.get_running_loop()
+    handler_cls = _make_web_handler(loop, conn, channel, js_content)
+    httpd = HTTPServer(("127.0.0.1", port), handler_cls)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    ble_label = "" if conn else " (no BLE device)"
+    ch_label = f" ch{channel}" if channel is not None else ""
+    bm = (
+        f"javascript:void(fetch('http://localhost:{port}/overlay.js')"
+        ".then(r=>r.text()).then(t=>{{const s=document.createElement('script');"
+        "s.nonce=document.querySelector('script[nonce]')?.nonce;"
+        "s.textContent=t;document.head.appendChild(s)}}))"
+    )
+
+    print(f"\n  Claude watch{ch_label}{ble_label} on http://localhost:{port}")
+    print(f"\n  Bookmark URL (add to Chrome bookmarks bar):")
+    print(f"    {bm}")
+    print(f"\n  Open claude.ai/settings/usage and click the bookmark.")
+    print(f"  Ctrl+C to stop.\n")
+
+    try:
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        httpd.shutdown()
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _parse_channel_value(s):
     """Parse 'ch:value' or plain 'value' string. Returns (value, channel)."""
@@ -342,8 +194,59 @@ def _parse_channel_value(s):
     return float(s), None
 
 
+async def do_scan():
+    """Scan and print discovered galvos."""
+    print("Scanning for GalvoCtrl devices (5s)...\n")
+    devices = await galvable.scan()
+    if not devices:
+        print("No GalvoCtrl devices found.")
+        return
+    print(f"Found {len(devices)} GalvoCtrl device(s):\n")
+    for d in devices:
+        name = d.name or "(unknown)"
+        rssi = d.rssi if d.rssi is not None else "?"
+        print(f"  {name:20s}  {d.address}  RSSI {rssi}")
+
+
+async def do_rename(identifier, new_name):
+    """Rename a galvo by name or BLE address."""
+    is_address = ":" in identifier or "-" in identifier
+    kwargs = {"address": identifier} if is_address else {"name": identifier}
+
+    print(f"Scanning for device '{identifier}'...")
+    try:
+        async with galvable.connect(**kwargs) as g:
+            print(f"Found at {g.address}, current name: {g.name}")
+            await g.rename(new_name)
+            print(f"Renamed to '{new_name}' — device is rebooting.")
+    except galvable.DeviceNotFoundError:
+        print(f"Device '{identifier}' not found.")
+        sys.exit(1)
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
 async def main():
     args = sys.argv[1:]
+
+    if "--help" in args or "-h" in args:
+        print(HELP_TEXT)
+        sys.exit(0)
+
+    if "--scan" in args:
+        await do_scan()
+        return
+
+    if "--rename" in args:
+        idx = args.index("--rename")
+        if idx + 2 >= len(args):
+            print("--rename requires two arguments: ID and NAME")
+            print("  ID is the device's current name or BLE address")
+            print("  e.g. --rename GalvoCtrl MyGalvo")
+            print("  e.g. --rename AA:BB:CC:DD:EE:FF MyGalvo")
+            sys.exit(1)
+        await do_rename(args[idx + 1], args[idx + 2])
+        return
 
     debug = "--debug" in args
     if debug:
@@ -365,49 +268,48 @@ async def main():
             sys.exit(1)
         args = args[:idx] + args[idx + 2:]
 
-    # Check for --claudewatch <seconds>
-    claude_watch_interval = None
-    if "--claudewatch" in args:
-        idx = args.index("--claudewatch")
+    # Check for --name <device name>
+    target_name = None
+    if "--name" in args:
+        idx = args.index("--name")
         if idx + 1 >= len(args):
-            print("--claudewatch requires an interval in seconds")
+            print("--name requires a device name")
             sys.exit(1)
-        try:
-            claude_watch_interval = int(args[idx + 1])
-            if claude_watch_interval <= 0:
-                raise ValueError
-        except ValueError:
-            print(f"Invalid --claudewatch interval: {args[idx + 1]}")
-            sys.exit(1)
+        target_name = args[idx + 1]
         args = args[:idx] + args[idx + 2:]
 
-    device = await find_device(debug=debug)
-    if not device:
-        if claude_watch_interval is not None:
-            # In claudewatch mode, continue without BLE — just show usage data
-            print("BLE device not found — running in display-only mode.")
-            try:
-                await claude_watch(None, claude_watch_interval, channel)
-            except KeyboardInterrupt:
-                pass
-            return
-        print("Device not found. Make sure ESP32-C3 is powered and advertising.")
-        sys.exit(1)
-    print(f"Found {DEVICE_NAME} at {device.address}")
+    # Check for --id <BLE address>
+    target_id = None
+    if "--id" in args:
+        idx = args.index("--id")
+        if idx + 1 >= len(args):
+            print("--id requires a BLE address")
+            sys.exit(1)
+        target_id = args[idx + 1]
+        args = args[:idx] + args[idx + 2:]
 
+    # Check for --claudewatch
+    claude_watch_mode = "--claudewatch" in args
+    if claude_watch_mode:
+        args.remove("--claudewatch")
+
+    # Connect
     try:
-        async with BleakClient(device) as client:
-            if claude_watch_interval is not None:
-                await claude_watch(client, claude_watch_interval, channel)
+        async with galvable.connect(
+            name=target_name, address=target_id
+        ) as conn:
+            print(f"Found {conn.name or 'GalvoCtrl'} at {conn.address}")
+
+            if claude_watch_mode:
+                await claude_watch(conn, channel)
             elif args:
                 value, ch_override = _parse_channel_value(args[0])
                 ch = ch_override if ch_override is not None else channel
-                if not (0.0 <= value <= 1.0):
-                    print("Value must be between 0.0 and 1.0")
-                    sys.exit(1)
-                await write_value(client, value, ch)
+                await conn.write(value, ch)
+                ch_label = f" to channel {ch}" if ch is not None else ""
+                print(f"Wrote {value:.4f}{ch_label}")
             else:
-                ch_hint = f" or ch:value for a specific channel" if channel is None else ""
+                ch_hint = " or ch:value for a specific channel" if channel is None else ""
                 print(f"Enter values 0.0-1.0{ch_hint} (q to quit):")
                 while True:
                     try:
@@ -416,14 +318,23 @@ async def main():
                             break
                         val, ch_override = _parse_channel_value(raw)
                         ch = ch_override if ch_override is not None else channel
-                        if not (0.0 <= val <= 1.0):
-                            print("Value must be between 0.0 and 1.0")
-                            continue
-                        await write_value(client, val, ch)
-                    except ValueError:
-                        print("Invalid input (use 0.5 or 2:0.5)")
+                        await conn.write(val, ch)
+                        ch_label = f" to channel {ch}" if ch is not None else ""
+                        print(f"Wrote {val:.4f}{ch_label}")
+                    except ValueError as e:
+                        print(f"Invalid input: {e}")
                     except KeyboardInterrupt:
                         break
+    except galvable.DeviceNotFoundError:
+        if claude_watch_mode:
+            print("BLE device not found — running in display-only mode.")
+            try:
+                await claude_watch(None, channel)
+            except KeyboardInterrupt:
+                pass
+            return
+        print("Device not found. Make sure ESP32-C3 is powered and advertising.")
+        sys.exit(1)
     except KeyboardInterrupt:
         pass
     print("Disconnected.")
