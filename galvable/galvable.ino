@@ -27,6 +27,7 @@
 
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include <BleOta.h>
 
 // WORKAROUND: Arduino ESP32 core 3.x releases BT controller memory before
 // setup() runs unless a library explicitly registers BT usage. NimBLE-Arduino
@@ -285,12 +286,17 @@ void setup() {
 
     pService->start();
 
+
+    // Begin BLE OTA before advertising
+    bleOta.begin();
+
     // ── Start advertising ──
     // The service UUID is included in the advertisement so clients can
     // filter by it during scanning (important because the device name
     // often gets truncated out of the 31-byte ad packet).
     NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->enableScanResponse(true);
     pAdvertising->setName(deviceName);
     pAdvertising->start();
 
@@ -300,8 +306,9 @@ void setup() {
 
 // ── Arduino Main Loop ───────────────────────────────────────────────────────
 
-// Nothing to do here — all work happens in BLE callbacks. The delay keeps
+// Nothing to do here other than handle BLE OTA events — all work happens in BLE callbacks. The delay keeps
 // the watchdog happy and prevents the idle task from being starved.
 void loop() {
-    delay(1000);
+    bleOta.handle();
+    delay(bleOta.isUpdating() ? 1 : 100);
 }

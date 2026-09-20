@@ -1,12 +1,108 @@
-# Galvable
+# Galvable / Retrometer
 
-Control an analog galvanometer (or six) over Bluetooth Low Energy using an ESP32-C3 microcontroller.
+[![Open Source Hardware](https://img.shields.io/badge/Open_Source-Hardware-00979D)](https://oshwa.org/definition/)
 
-## Overview
+The canonical project lives in `esp32_ble_ota_base/sketches/galvable`.
+It contains the BLE galvanometer firmware, Python clients, Retrometer website,
+and physical faceplate/reference files. Git history and the GitHub remote are
+preserved from `joshu017/galvable` (baseline `f3f8420`).
 
-This project turns an ESP32-C3 into a BLE-controlled galvanometer driver with up to 6 independent PWM channels. A BLE client writes a floating-point value (0.0 to 1.0) to the device, optionally targeting a specific channel, which translates it into a 10-bit PWM signal to drive analog movement galvanometers. The built-in LED (GPIO8 on the esp32c3 supermini dev board) lights up when a client is connected.
+## Layout
 
-A reference implementation of a Python client is included for controlling the device from the command line.
+- `galvable/galvable.ino`: existing BLE OTA firmware, including persistent device names.
+- `Makefile`: local ESP32-C3 build, USB upload and BLE OTA commands.
+- `lib/BleOta/`, `scripts/ble_ota_upload.py`: preserved OTA support.
+- `galvo_client.py`: unchanged checked-in client, including Claude usage polling.
+- `retrometer/retrometer.py`: working Mercury tracker and optional BLE output.
+- `retrometer/*.svg`, `*.pdf`: faceplate and cutting artwork.
+- `retrometer/reference/mercury2000.pdf`: source ephemeris from the separate folder.
+- `retrometer/web/public/index.html`: canonical website source, matching the live page at migration.
+- `retrometer/web/`: Cloudflare Workers scaffold, following Ringbeacon's structure.
+- `AGENTS.md`: contributor and agent instructions.
+
+## Firmware
+
+ESP32-C3 only. Run the local Makefile from this project directory:
+
+```sh
+make help
+make setup                         # install pinned core and NimBLE, if needed
+make build                         # compile only
+make ports
+make flash UPLOAD_PORT=/dev/cu.usbmodem...  # explicit USB target
+make ble BLE_DEVICE_ADDRESS=<device-address>  # explicit OTA target
+make monitor UPLOAD_PORT=/dev/cu.usbmodem...
+make clean
+```
+
+`make` defaults to build. Defaults retain `PartitionScheme=min_spiffs`,
+`CDCOnBoot=cdc`, upload speed 921600 and the prior compilation flags.
+Setup pins ESP32 core 3.3.10 and NimBLE-Arduino 2.3.8, matching the installed
+toolchain when this Makefile was created; the field device's toolchain is unknown.
+No setup/install or flash occurs during a normal build.
+
+The firmware remains unchanged. `lib/BleOta` and `scripts/ble_ota_upload.py`
+are unchanged local copies from the former parent framework, so builds and OTA
+uploads no longer depend on that framework or `board_config.mk`. The Makefile
+explicitly selects the local BleOta library over globally installed copies.
+Historical firmware remains in Git history.
+
+USB uploads and serial monitoring require `UPLOAD_PORT`. OTA requires the
+intended `BLE_DEVICE_ADDRESS` (a UUID on macOS) or an explicit
+`BLE_DEVICE_NAME`; an address takes precedence. The device's name is stored
+in NVS and defaults to `GalvoCtrl`. A name passed to make only selects the
+upload target—it does not rename firmware. BLE OTA also requires Python `bleak`
+(see below). Uploading still requires a device already running the OTA service.
+Use `make help` for overrides. Build output stays in ignored `build/`.
+No device was flashed during the migration.
+
+## Python
+
+The clients are standalone scripts; there is no local Python package.
+Install `bleak` for BLE control, then run from the project root:
+
+```sh
+python3 -m pip install bleak
+python3 galvo_client.py --help
+python3 retrometer/retrometer.py                  # display only; no BLE needed
+python3 retrometer/retrometer.py 4-13-2026         # historical date
+python3 retrometer/retrometer.py --name Retrometer --watch 3600
+python3 retrometer/retrometer.py --id <device-address> --channel 2
+```
+
+`galvo_client.py` retains the checked-in direct control and Claude usage polling.
+Retrometer uses Bleak directly for optional BLE output. Its station data,
+shadow approximation and gauge calculations are unchanged.
+
+## Website
+
+```sh
+cd retrometer/web
+npm ci
+npm run dev
+npm run check
+npm run deploy
+```
+
+Local development serves on localhost. `npm run check` validates the deployment
+bundle without publishing. `npm run deploy` publishes to the existing
+`retrometer` Worker in your authenticated Cloudflare account. Wrangler must be logged
+in with access to that account (`npx wrangler whoami`).
+
+The scaffold uses Workers custom domains for `retrometer.online` and
+`www.retrometer.online` and disables
+workers.dev, matching Ringbeacon. The compatibility date is `2026-09-20`, matching Ringbeacon; observability stays
+enabled. No account ID is hardcoded in the configuration. Cloudflare manages the custom domain DNS. The website is static HTML/CSS/JavaScript; only `public/`
+is uploaded. Unknown navigation paths fall back to the page. There are no
+server bindings, secrets, or frontend build step. Edit `retrometer/web/public/index.html`,
+which replaces the old copy/paste dashboard source. Browser calibration stays in localStorage
+on the production origin; localhost uses a separate calibration store.
+
+For Cloudflare Git builds, use `retrometer/web` as the root directory, `npm ci && npm run check`
+as the build command, and `npm run deploy` as the deploy command. Connecting Git
+builds is separate from this local scaffold.
+
+
 
 ## Hardware Requirements
 
@@ -40,88 +136,6 @@ The potentiometer limits the maximum current through the galvanometer so that it
 
 > **Tip:** To change pin assignments or reduce the number of channels, edit the `GALVO_PINS[]` array in the sketch. The firmware automatically detects the number of active channels from the array length.  There is no penalty to leaving all defaults defined, even if you are planning on connecting fewer galvanometers.
 
-## Software Requirements
-
-### Firmware (Arduino)
-
-- [Arduino IDE](https://www.arduino.cc/en/software) or [Arduino CLI](https://arduino.github.io/arduino-cli/)
-- **ESP32 board package:** "esp32 by Espressif Systems" v3.x (tested on v3.3.7)
-- **BLE library:** [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) v2.x by h2zero (tested on v2.3.7)
-
-### Python Client
-
-- Python 3.8+
-- [bleak](https://github.com/hbldh/bleak) BLE library
-
-## Project Structure
-
-```
-galvable/
-  esp32c3_galvo/
-    esp32c3_galvo.ino   Arduino sketch (BLE server + PWM output)
-  galvo_client.py       Python BLE client
-  README.md             This file
-  LICENSE               Apache License 2.0
-```
-
-## Arduino Setup
-
-### 1. Install the ESP32 Board Package
-
-**Arduino IDE:**
-1. Open **File > Preferences**
-2. Add to "Additional Board Manager URLs": `https://espressif.github.io/arduino-esp32/package_esp32_index.json`
-3. Open **Tools > Board > Board Manager**, search "esp32", install "esp32 by Espressif Systems" (v3.x)
-
-**Arduino CLI:**
-```bash
-arduino-cli config add board_manager.additional_urls \
-  https://espressif.github.io/arduino-esp32/package_esp32_index.json
-arduino-cli core update-index
-arduino-cli core install esp32:esp32
-```
-
-### 2. Install NimBLE-Arduino
-
-**Arduino IDE:**
-1. Open **Sketch > Include Library > Manage Libraries**
-2. Search "NimBLE-Arduino", install v2.x by h2zero
-
-**Arduino CLI:**
-```bash
-arduino-cli lib install "NimBLE-Arduino"
-```
-
-### 3. Board Settings
-
-| Setting          | Value              |
-|------------------|--------------------|
-| Board            | ESP32C3 Dev Module |
-| USB CDC On Boot  | Enabled            |
-| Upload Speed     | 921600             |
-| Flash Mode       | QIO                |
-| Partition Scheme | Default 4MB        |
-
-### 4. Compile and Upload
-
-**Arduino IDE:**
-1. Open `esp32c3_galvo/esp32c3_galvo.ino`
-2. Select the board and port under **Tools**
-3. Click **Upload**
-
-**Arduino CLI:**
-```bash
-arduino-cli compile --fqbn esp32:esp32:esp32c3 esp32c3_galvo/
-arduino-cli upload --fqbn esp32:esp32:esp32c3 -p /dev/cu.usbmodem* esp32c3_galvo/
-```
-
-### 5. Verify
-
-Open the Serial Monitor at **115200 baud**. You should see:
-
-```
-BLE Galvo Controller (6 channels) ... ready!
-```
 
 ## BLE Protocol
 
@@ -248,54 +262,71 @@ On macOS, your terminal application (Terminal, iTerm2, etc.) needs Bluetooth acc
 2. Enable Bluetooth access for your terminal app
 3. You may need to restart the terminal after granting permission
 
-## How It Works
 
-### Firmware
+### Persistent device names
 
-1. The ESP32-C3 initializes a NimBLE BLE server with a single writable characteristic
-2. PWM is configured on all channels in `GALVO_PINS[]` using `ledcAttach()` at 5 kHz, 10-bit resolution
-3. The built-in LED (GPIO8, active low) turns on when a client connects
-4. When a client writes to the characteristic:
-   - **4-byte write:** decoded as a float, applied to channel 0
-   - **5-byte write:** first 4 bytes as float, 5th byte as channel index
-   - The value is clamped to [0.0, 1.0] with `NaN` protection
-   - The float is scaled to a duty cycle: `duty = (int)(value * 1000.0)`
-   - `ledcWrite()` outputs the PWM signal on the corresponding GPIO
-5. The galvanometer needle deflects proportionally to the duty cycle
-6. After disconnect, the LED turns off and the device re-advertises
+The default is `GalvoCtrl`; the existing working firmware also supports names
+stored in NVS. The name characteristic is
+`a1b2c3d4-5e6f-7890-abcd-ef1234567891` (read/write). Writing 1–20 UTF-8 bytes
+persists the name and reboots the board. The original checked-in firmware lacks
+this additional characteristic; Retrometer already tolerates its absence.
+The retained CLI does not expose renaming. Firmware name support is unchanged.
 
-### Python Client
+## Consolidation and firmware compatibility
 
-1. Uses an async BLE scanner with a detection callback for fast discovery (returns immediately when device is found, rather than waiting for the full scan timeout)
-2. Matches the device by name (`GalvoCtrl`) or advertised service UUID
-3. Encodes the float value as 4 bytes (`struct.pack('<f', value)`) or 5 bytes with a channel index (`struct.pack('<fB', value, channel)`)
-4. Passes the `BLEDevice` object directly to `BleakClient` for reliable connection on macOS
+The Git baseline is `f3f8420` from `/Users/josh/Sync/arduino/esp32c3_galvo`, with
+history and the `joshu017/galvable` remote retained. The original folders remain
+intact as recovery copies. No device was flashed during consolidation.
+The checked-in client is retained unchanged. The experimental Python package
+and browser bridge were removed; Retrometer now uses Bleak directly. Artwork
+and gauge calculations are unchanged. The extra sketches/retrometer folder contained
+only the reference ephemeris, now in `retrometer/reference/`.
 
-## Known Issues
+The three firmware baselines were compared during consolidation:
 
-- **NimBLE-Arduino + Arduino ESP32 core 3.x:** The Arduino core releases BLE controller memory before `setup()` runs unless a BLE library registers itself. NimBLE-Arduino 2.x does not do this automatically. The sketch includes `#include "esp32-hal-bt-mem.h"` as a workaround to prevent a crash during `NimBLEDevice::init()`. See [espressif/arduino-esp32#4243](https://github.com/espressif/arduino-esp32/issues/4243).
+| Comparison | Existing differences |
+|---|---|
+| Committed → older working copy | Persistent name in NVS, additional name read/write characteristic, rename-triggered reboot, and boot/name logging. |
+| Older working copy → destination | BleOta include, initialization before advertising, scan response enabled, OTA handling in loop, and shorter OTA-aware delay. |
+| Destination → consolidated project | No firmware source changes. |
 
-- **`analogWriteResolution()` crash:** On ESP32 Arduino core 3.x, calling `analogWriteResolution()` before the first `analogWrite()` can crash due to a null pointer in the LEDC driver. The sketch uses `ledcAttach()` + `ledcWrite()` instead. See [espressif/arduino-esp32#11670](https://github.com/espressif/arduino-esp32/issues/11670).
+Across all three, the complete galvo write callback, duty-output function and
+connect/disconnect callbacks are identical. Control UUIDs, 4-byte float and
+5-byte float-plus-channel formats, clamping, channel pins, and 5 kHz/10-bit PWM
+are unchanged. Historical firmware remains in Git and the original working
+folder. Additive BLE services/advertising and loop changes existed before
+this consolidation; source inspection does not prove which build is on the
+field device or prove OTA/GATT behavior on hardware. Do not update that device
+until its running firmware and a bench-tested replacement are identified.
 
-- **Device name not visible in BLE scan:** The 128-bit service UUID consumes most of the 31-byte BLE advertisement packet, leaving no room for the device name. The Python client falls back to matching by service UUID.
+The website source matched the production page apart from a leading newline.
+The dashboard Worker had no bindings and used the wildcard route
+`*retrometer.online/*`. The new scaffold serves the same HTML as static assets.
+The old embedded `worker.txt` remains in the recovery copy, not as another active
+source in this repository.
 
-## Debug Mode
+Validation completed: deployment dry run, local HTTP response identical to the
+HTML source, live-page comparison, JavaScript syntax, Python syntax, Retrometer
+CLI display/date smoke check, mocked BLE name/address selection and 4/5-byte
+write checks, and the firmware source comparisons above.
+The local ESP32-C3 Makefile build passed with core 3.3.10 and NimBLE 2.3.8.
+Missing-target checks passed for USB upload, serial monitoring and BLE OTA.
+Firmware source was not edited and no hardware connection was made. See the deployment status below for production cutover progress.
 
-Uncomment `#define DEBUG` at the top of the sketch to enable:
-- A 2-second boot delay (gives time to open Serial Monitor)
-- `Serial.flush()` after each debug print (ensures output is visible before any crash)
+### Deployment status
 
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| **Guru Meditation crash on boot** | Ensure `#include "esp32-hal-bt-mem.h"` is present. See Known Issues above. |
-| **Device not found** | Ensure ESP32-C3 is powered. Use `--debug` flag on the Python client to list all visible BLE devices. Check macOS Bluetooth permissions. |
-| **Device found but connection fails** | The ESP32-C3 may still be connected to a previous client. Reset the board or wait for the connection to time out. |
-| **Galvo doesn't move** | Verify wiring: GPIO4 -> pot -> galvo+ -> galvo- -> GND. Check Serial Monitor for "Set duty" messages. |
-| **Serial Monitor shows nothing** | Enable "USB CDC On Boot" in board settings. Set baud rate to 115200. |
-| **Python script errors** | Ensure `bleak` is installed: `pip install bleak`. Python 3.8+ is required. |
+Both hostnames verified on 2026-09-20 after deployment
+`eed0b008-0e52-4a1a-a38d-2a8f464250b5`.
+`retrometer.online` and `www.retrometer.online` are attached as Worker custom
+domains. The old `www` CNAME was removed before attaching that hostname; a
+CNAME alone does not give a hostname its own Worker binding. Both URLs serve
+the same page. Browser calibration remains separate per origin.
+The user removed the conflicting apex A record; after successful attachment,
+the obsolete `*retrometer.online/*` route was removed. Cloudflare reports no
+remaining zone routes. HTTPS returned 200 with HTML matching the canonical
+source both before and after route removal. The scaffold has no hardcoded
+account ID and disables workers.dev, matching RingBeacon.
 
 ## License
 
-This project is licensed under the Apache License 2.0. See [LICENSE](LICENSE) for details.
+Apache License 2.0; see [LICENSE](LICENSE).

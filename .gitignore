@@ -20,3 +20,10 @@ venv/
 *.swp
 *.swo
 *~
+
+# Python environment and Workers tooling
+.venv/
+node_modules/
+.wrangler/
+.dev.vars*
+.env.*
